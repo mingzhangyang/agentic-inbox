@@ -10,8 +10,9 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
-		// The worker now fails closed outside local development if Access is not configured.
+		// Set to "true" to enforce Cloudflare Access JWT validation in production.
+		// Keep "false" for unauthenticated deployments while bootstrapping.
+		"ACCESS_AUTH_ENABLED": "false",
 		"DOMAINS": "in10years.app",
 		"EMAIL_ADDRESSES": []
 	},

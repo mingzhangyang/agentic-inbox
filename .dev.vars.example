@@ -1,3 +1,4 @@
-# Cloudflare Access (required in production)
+# Cloudflare Access (set ACCESS_AUTH_ENABLED=true to enforce in production)
+ACCESS_AUTH_ENABLED=false
 POLICY_AUD=your-access-policy-audience-tag
 TEAM_DOMAIN=https://your-team.cloudflareaccess.com

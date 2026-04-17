@@ -28,6 +28,42 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
+const ACCESS_AUTH_ENABLED_DEFAULT = false;
+
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean) {
+	if (value === undefined) return defaultValue;
+	const normalized = value.trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return defaultValue;
+}
+
+function normalizeTeamDomain(raw: string | undefined): string {
+	const domain = (raw ?? "").trim();
+	if (!domain) return "";
+	return domain.startsWith("http://") || domain.startsWith("https://")
+		? domain
+		: `https://${domain}`;
+}
+
+function getCfAuthorizationCookie(cookieHeader: string | undefined): string | undefined {
+	if (!cookieHeader) return undefined;
+	const pairs = cookieHeader.split(";");
+	for (const pair of pairs) {
+		const [rawKey, ...rawValueParts] = pair.split("=");
+		if (!rawKey || rawValueParts.length === 0) continue;
+		if (rawKey.trim() !== "CF_Authorization") continue;
+		const rawValue = rawValueParts.join("=").trim();
+		if (!rawValue) return undefined;
+		try {
+			return decodeURIComponent(rawValue);
+		} catch {
+			return rawValue;
+		}
+	}
+	return undefined;
+}
+
 // Main app that wraps the API and adds React Router fallback
 const app = new Hono<{ Bindings: Env }>();
 
@@ -38,27 +74,41 @@ app.use("*", async (c, next) => {
 		return next();
 	}
 
-	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
+	const accessAuthEnabled = parseBooleanEnv(
+		c.env.ACCESS_AUTH_ENABLED,
+		ACCESS_AUTH_ENABLED_DEFAULT,
+	);
+	if (!accessAuthEnabled) {
+		return next();
+	}
+
+	const { POLICY_AUD } = c.env;
+	const TEAM_DOMAIN = normalizeTeamDomain(c.env.TEAM_DOMAIN);
 
 	// Fail closed in production if Access is not configured.
 	if (!POLICY_AUD || !TEAM_DOMAIN) {
 		return c.text(
-			"Cloudflare Access must be configured in production. Set POLICY_AUD and TEAM_DOMAIN.",
+			"Cloudflare Access auth is enabled but not configured. Set POLICY_AUD and TEAM_DOMAIN, or set ACCESS_AUTH_ENABLED=false to disable this check.",
 			500,
 		);
 	}
 
-	const token = c.req.header("cf-access-jwt-assertion");
+	const token =
+		c.req.header("cf-access-jwt-assertion")
+		?? getCfAuthorizationCookie(c.req.header("cookie"));
 	if (!token) {
-		return c.text("Missing required CF Access JWT", 403);
+		return c.text(
+			"Missing required CF Access JWT. Enable Cloudflare Access on this route or set ACCESS_AUTH_ENABLED=false.",
+			403,
+		);
 	}
 
 	try {
 		const JWKS = createRemoteJWKSet(
-			new URL(`${TEAM_DOMAIN}/cdn-cgi/access/certs`),
+			new URL(`${TEAM_DOMAIN.replace(/\/+$/, "")}/cdn-cgi/access/certs`),
 		);
 		await jwtVerify(token, JWKS, {
-			issuer: TEAM_DOMAIN,
+			issuer: TEAM_DOMAIN.replace(/\/+$/, ""),
 			audience: POLICY_AUD,
 		});
 	} catch {
