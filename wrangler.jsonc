@@ -10,9 +10,10 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		// Set to "true" to enforce Cloudflare Access JWT validation in production.
-		// Keep "false" for unauthenticated deployments while bootstrapping.
-		"ACCESS_AUTH_ENABLED": "false",
+		// ACCESS_AUTH_ENABLED, POLICY_AUD, and TEAM_DOMAIN are NOT set here so
+		// wrangler does not generate narrow literal types that break the type system.
+		// Set them as environment variables in the Cloudflare dashboard (or .dev.vars
+		// locally). Auth is ON by default — set ACCESS_AUTH_ENABLED=false to disable.
 		"DOMAINS": "in10years.app",
 		"EMAIL_ADDRESSES": []
 	},

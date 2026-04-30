@@ -285,7 +285,7 @@ export class EmailAgent extends AIChatAgent<any> {
 			system: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
-			stopWhen: stepCountIs(5),
+			stopWhen: stepCountIs(10),
 			onFinish,
 		});
 
@@ -298,6 +298,10 @@ export class EmailAgent extends AIChatAgent<any> {
 	 */
 	async onRequest(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === "/destroy" && request.method === "DELETE") {
+			await this.ctx.storage.deleteAll();
+			return new Response(null, { status: 204 });
+		}
 		if (url.pathname === "/onNewEmail" && request.method === "POST") {
 			try {
 				const emailData = await request.json() as {
@@ -467,7 +471,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
-				stopWhen: stepCountIs(5),
+				stopWhen: stepCountIs(7),
 			});
 
 			// Check if draft_reply was called (saves to Drafts as side effect).

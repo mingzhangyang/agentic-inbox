@@ -49,6 +49,38 @@ export interface AttachmentInfo {
 
 // ── Zod Schemas ────────────────────────────────────────────────────
 
+export const MailboxSettingsSchema = z
+	.object({
+		fromName: z.string().max(100).optional(),
+		agentSystemPrompt: z.string().max(10_000).optional(),
+		autoDraftEnabled: z.boolean().optional(),
+		forwarding: z
+			.object({
+				enabled: z.boolean(),
+				email: z.union([z.string().email(), z.literal("")]).optional(),
+			})
+			.strict()
+			.optional(),
+		signature: z
+			.object({
+				enabled: z.boolean(),
+				text: z.string().max(5_000).optional(),
+			})
+			.strict()
+			.optional(),
+		autoReply: z
+			.object({
+				enabled: z.boolean(),
+				subject: z.string().max(200).optional(),
+				message: z.string().max(5_000).optional(),
+			})
+			.strict()
+			.optional(),
+	})
+	.strict();
+
+export type MailboxSettings = z.infer<typeof MailboxSettingsSchema>;
+
 const RecipientFieldSchema = z.union([
 	z.string().email(),
 	z.array(z.string().email()).min(1),

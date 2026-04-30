@@ -29,7 +29,6 @@ export async function isPromptInjection(ai: Ai, bodyHtml: string | null | undefi
 
 	try {
 		const response = (await ai.run(
-			// @ts-expect-error — model string not in generated union
 			"@cf/meta/llama-3.1-8b-instruct-fast",
 			{
 				messages: [
@@ -117,9 +116,10 @@ function splitQuotedBlock(html: string): { reply: string; quoted: string } {
 
 /**
  * Verify and clean a draft email body using AI.
- * Falls back to returning the original body if the AI call fails.
+ * Returns null if the AI verifier fails so callers can avoid saving or
+ * sending unverified content.
  */
-export async function verifyDraft(ai: Ai, body: string): Promise<string> {
+export async function verifyDraft(ai: Ai, body: string): Promise<string | null> {
 	if (!body || !body.trim()) return body;
 
 	// Separate the quoted reply block so the AI only reviews the user's text
@@ -183,8 +183,8 @@ export async function verifyDraft(ai: Ai, body: string): Promise<string> {
 			? `${cleanedTrimmed}\n\n${quotedBlock}`
 			: cleanedTrimmed;
 	} catch (e) {
-				console.error("AI failed — returns empty body, callers may save blank draft:", (e as Error).message);
-		return "";
+		console.error("Draft verifier failed:", (e as Error).message);
+		return null;
 	}
 }
 

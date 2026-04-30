@@ -28,7 +28,7 @@ const requestHandler = createRequestHandler(
 	import.meta.env.MODE,
 );
 
-const ACCESS_AUTH_ENABLED_DEFAULT = false;
+const ACCESS_AUTH_ENABLED_DEFAULT = true;
 
 function parseBooleanEnv(value: string | undefined, defaultValue: boolean) {
 	if (value === undefined) return defaultValue;

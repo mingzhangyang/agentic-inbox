@@ -9,6 +9,12 @@ import { defineConfig } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@babel/runtime-corejs3/core-js/instance/trim":
+        "core-js-pure/features/instance/trim.js",
+    },
+  },
   plugins: [
     cloudflare({ viteEnvironment: { name: "ssr" } }),
     tailwindcss(),

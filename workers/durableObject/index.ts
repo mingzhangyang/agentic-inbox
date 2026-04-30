@@ -816,6 +816,33 @@ export class MailboxDO extends DurableObject<Env> {
 		return null;
 	}
 
+	// ── Mailbox lifecycle ─────────────────────────────────────────────
+
+	/**
+	 * Return all attachment records before mailbox deletion so the route
+	 * handler can remove R2 blobs before destroying this DO's storage.
+	 */
+	async listAttachmentKeys(): Promise<{ emailId: string; attachmentId: string; filename: string }[]> {
+		const attachments = this.db
+			.select({
+				email_id: schema.attachments.email_id,
+				id: schema.attachments.id,
+				filename: schema.attachments.filename,
+			})
+			.from(schema.attachments)
+			.all();
+
+		return attachments.map((a) => ({
+			emailId: a.email_id,
+			attachmentId: a.id,
+			filename: a.filename,
+		}));
+	}
+
+	async destroy(): Promise<void> {
+		await this.ctx.storage.deleteAll();
+	}
+
 	// ── Email creation (Drizzle) ───────────────────────────────────
 
 	async createEmail(
@@ -823,7 +850,33 @@ export class MailboxDO extends DurableObject<Env> {
 		email: EmailData,
 		attachments: AttachmentData[],
 	) {
-		// Resolve folder name or ID to the actual folder ID.
+		this.insertEmail(folder, email, attachments);
+	}
+
+	/**
+	 * Atomically replace an existing draft with new content.
+	 * Runs delete + insert in a single DO method call — no async between
+	 * the two operations — so a Worker crash cannot leave a gap.
+	 */
+	async replaceDraft(
+		oldDraftId: string | null,
+		email: EmailData,
+		attachments: AttachmentData[],
+	): Promise<{ id: string; date: string }> {
+		this.ctx.storage.transactionSync(() => {
+			if (oldDraftId) {
+				this.db.delete(schema.emails).where(eq(schema.emails.id, oldDraftId)).run();
+			}
+			this.insertEmail(Folders.DRAFT, email, attachments);
+		});
+		return { id: email.id, date: email.date };
+	}
+
+	private insertEmail(
+		folder: string,
+		email: EmailData,
+		attachments: AttachmentData[],
+	) {
 		const folderRow = this.db
 			.select({ id: schema.folders.id })
 			.from(schema.folders)
@@ -841,8 +894,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const folderId = folderRow.id;
 		const isSent = folderId === Folders.SENT;
 
-		// Sent emails are always read — the sender obviously knows what they wrote.
-		// This prevents sent replies from inflating thread_unread_count.
+		// Sent emails are always read; the sender already knows what they wrote.
 		this.db
 			.insert(schema.emails)
 			.values({

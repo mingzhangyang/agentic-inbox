@@ -25,15 +25,15 @@ Click the button above to deploy to your Cloudflare account. The deploy flow wil
 1. **Set up Email Routing** -- In the Cloudflare dashboard, go to your domain > Email Routing and create a catch-all rule that forwards to this Worker
 2. **Enable Email Service** -- The worker needs the `send_email` binding to send outbound emails. See [Email Service docs](https://developers.cloudflare.com/email-routing/email-workers/send-email-workers/)
 3. **Create a mailbox** -- Visit your deployed app and create a mailbox for any address on your domain (e.g. `hello@example.com`)
-4. **Optional: Configure Cloudflare Access** -- Enable [one-click Cloudflare Access](https://developers.cloudflare.com/changelog/post/2025-10-03-one-click-access-for-workers/) on your Worker under Settings > Domains & Routes. The modal will show your `POLICY_AUD` and `TEAM_DOMAIN` values.
-5. **Auth mode** -- `ACCESS_AUTH_ENABLED` defaults to `"false"` in this template. Set `ACCESS_AUTH_ENABLED="true"` plus `POLICY_AUD` and `TEAM_DOMAIN` to enforce Cloudflare Access JWT validation.
+4. **Configure Cloudflare Access** -- Auth is enabled by default in production. Enable [one-click Cloudflare Access](https://developers.cloudflare.com/changelog/post/2025-10-03-one-click-access-for-workers/) on your Worker under Settings > Domains & Routes. The modal will show your `POLICY_AUD` and `TEAM_DOMAIN` values.
+5. **Auth mode** -- Leave `ACCESS_AUTH_ENABLED` unset or set it to `"true"` with `POLICY_AUD` and `TEAM_DOMAIN` to enforce Cloudflare Access JWT validation. Set `ACCESS_AUTH_ENABLED=false` only for local development or intentionally public deployments.
 
 ## Features
 
 - **Full email client** — Send and receive emails via Cloudflare Email Routing with a rich text composer, reply/forward threading, folder organization, search, and attachments
 - **Per-mailbox isolation** — Each mailbox runs in its own Durable Object with SQLite storage and R2 for attachments
 - **Built-in AI agent** — Side panel with 9 email tools for reading, searching, drafting, and sending
-- **Auto-draft on new email** — Agent automatically reads inbound emails and generates draft replies, always requiring explicit confirmation before sending
+- **Auto-draft on new email** — Agent automatically reads inbound emails and generates draft replies, always requiring explicit confirmation before sending. Set per-mailbox `autoDraftEnabled` to `false` to disable this behavior.
 - **Configurable and persistent** — Custom system prompts per mailbox, persistent chat history, streaming markdown responses, and tool call visibility
 
 ## Stack
@@ -41,7 +41,11 @@ Click the button above to deploy to your Cloudflare account. The deploy flow wil
 - **Frontend:** React 19, React Router v7, Tailwind CSS, Zustand, TipTap, `@cloudflare/kumo`
 - **Backend:** Hono, Cloudflare Workers, Durable Objects (SQLite), R2, Email Routing
 - **AI Agent:** Cloudflare Agents SDK (`AIChatAgent`), AI SDK v6, Workers AI (`@cf/moonshotai/kimi-k2.5`), `react-markdown` + `remark-gfm`
-- **Auth:** Optional Cloudflare Access JWT validation (enabled with `ACCESS_AUTH_ENABLED=true`)
+- **Auth:** Cloudflare Access JWT validation enabled by default in production
+
+## Agent Cost Controls
+
+Auto-draft runs on inbound mail when `autoDraftEnabled` is not `false`. Each auto-draft attempt can call Workers AI for prompt-injection scanning, draft generation, and draft verification. Disable auto-draft per mailbox for high-volume addresses that should only be reviewed manually.
 
 ## Getting Started
 

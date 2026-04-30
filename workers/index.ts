@@ -15,7 +15,7 @@ import {
 	buildThreadingHeaders,
 	listMailboxes,
 } from "./lib/email-helpers";
-import { SendEmailRequestSchema } from "./lib/schemas";
+import { SendEmailRequestSchema, MailboxSettingsSchema } from "./lib/schemas";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
@@ -28,7 +28,7 @@ type AppContext = Context<MailboxContext>;
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
 	name: z.string().min(1),
-	settings: z.record(z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
+	settings: MailboxSettingsSchema.optional(),
 });
 
 const DraftBody = z.object({
@@ -108,7 +108,7 @@ app.post("/api/v1/mailboxes", async (c) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
+	const defaultSettings = { fromName: name, autoDraftEnabled: true, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
 	const finalSettings = { ...defaultSettings, ...settings };
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
@@ -123,9 +123,17 @@ app.get("/api/v1/mailboxes/:mailboxId", async (c) => {
 	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings: await obj.json() });
 });
 
+const UpdateMailboxBody = z.object({ settings: MailboxSettingsSchema });
+
 app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const { settings } = (await c.req.json()) as { settings: Record<string, unknown> };
+	let parsed: z.infer<typeof UpdateMailboxBody>;
+	try {
+		parsed = UpdateMailboxBody.parse(await c.req.json());
+	} catch (e) {
+		return c.json({ error: "Invalid settings", details: (e as z.ZodError).issues }, 400);
+	}
+	const { settings } = parsed;
 	const key = `mailboxes/${mailboxId}.json`;
 	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
 	await c.env.BUCKET.put(key, JSON.stringify(settings));
@@ -136,7 +144,34 @@ app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
 	const key = `mailboxes/${mailboxId}.json`;
 	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.delete(key); // TODO: also delete DO data and R2 attachment blobs
+
+	// 1. Collect attachment paths before destructive work so failed R2 deletes can be retried.
+	const mailboxStub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(mailboxId));
+	const attachments = await mailboxStub.listAttachmentKeys();
+
+	// 2. Batch-delete R2 attachment blobs.
+	if (attachments.length > 0) {
+		const keys = attachments.map(
+			(a) => `attachments/${a.emailId}/${a.attachmentId}/${a.filename}`,
+		);
+		// R2 delete accepts up to 1000 keys per call.
+		for (let i = 0; i < keys.length; i += 1000) {
+			await c.env.BUCKET.delete(keys.slice(i, i + 1000));
+		}
+	}
+
+	// 3. Clear Durable Object storage only after external attachment blobs are gone.
+	await mailboxStub.destroy();
+
+	// 4. Clear the EmailAgent DO storage. Let failures abort metadata deletion for retry.
+	const agentStub = c.env.EMAIL_AGENT.get(c.env.EMAIL_AGENT.idFromName(mailboxId));
+	const agentDestroyResponse = await agentStub.fetch(new Request("https://agent/destroy", { method: "DELETE" }));
+	if (!agentDestroyResponse.ok) {
+		throw new Error(`EmailAgent destroy failed with status ${agentDestroyResponse.status}`);
+	}
+
+	// 5. Remove the mailbox metadata key last so a retry is safe if steps above fail.
+	await c.env.BUCKET.delete(key);
 	return c.body(null, 204);
 });
 
@@ -215,10 +250,10 @@ app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
 	const mailboxId = c.req.param("mailboxId")!;
 	const { to, cc, bcc, subject, body, in_reply_to, thread_id, draft_id } = DraftBody.parse(await c.req.json());
 	const stub = c.var.mailboxStub;
-	if (draft_id) await stub.deleteEmail(draft_id); // not atomic — create-then-delete would be safer
 	const messageId = crypto.randomUUID();
 	const now = new Date().toISOString();
-	await stub.createEmail(Folders.DRAFT, {
+	// replaceDraft is a single DO method call — delete + insert are atomic.
+	await stub.replaceDraft(draft_id ?? null, {
 		id: messageId, subject: subject || "", sender: mailboxId.toLowerCase(),
 		recipient: (to || "").toLowerCase(), cc: cc?.toLowerCase() || null, bcc: bcc?.toLowerCase() || null,
 		date: now, body, in_reply_to: in_reply_to || null, email_references: null,
@@ -329,6 +364,21 @@ app.get("/api/v1/mailboxes/:mailboxId/emails/:emailId/attachments/:attachmentId"
 
 const MAX_EMAIL_SIZE = 25 * 1024 * 1024;
 
+/**
+ * Parse the sender's Date header into an ISO string.
+ * Rejects dates that are more than 2 days in the future (clock skew / spoofing)
+ * or before 2000-01-01 (clearly invalid). Falls back to the current time.
+ */
+function parseSenderDate(raw: string | undefined): string {
+	if (!raw) return new Date().toISOString();
+	const d = new Date(raw);
+	if (isNaN(d.getTime())) return new Date().toISOString();
+	const now = Date.now();
+	if (d.getTime() > now + 2 * 24 * 60 * 60 * 1000) return new Date().toISOString();
+	if (d.getFullYear() < 2000) return new Date().toISOString();
+	return d.toISOString();
+}
+
 async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	if (streamSize > MAX_EMAIL_SIZE) throw new Error(`Email too large: ${streamSize} bytes exceeds ${MAX_EMAIL_SIZE} byte limit`);
 	if (streamSize <= 0) throw new Error(`Invalid stream size: ${streamSize}`);
@@ -396,17 +446,21 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		id: messageId, subject: parsedEmail.subject || "",
 		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
-		date: new Date().toISOString(), // uses receive time, not the email's Date header
+		date: parseSenderDate(parsedEmail.date),
 		body: parsedEmail.html || parsedEmail.text || "",
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
 
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
-	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
-	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	const settingsObj = await env.BUCKET.get(`mailboxes/${mailboxId}.json`);
+	const settings = settingsObj ? await settingsObj.json<{ autoDraftEnabled?: boolean }>() : {};
+	if (settings.autoDraftEnabled !== false) {
+		const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
+		ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
+			method: "POST", headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+		})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	}
 }
 
 export { app, receiveEmail };
