@@ -34,6 +34,7 @@ Click the button above to deploy to your Cloudflare account. The deploy flow wil
 - **Per-mailbox isolation** — Each mailbox runs in its own Durable Object with SQLite storage and R2 for attachments
 - **Built-in AI agent** — Side panel with 9 email tools for reading, searching, drafting, and sending
 - **Auto-draft on new email** — Agent automatically reads inbound emails and generates draft replies, always requiring explicit confirmation before sending. Set per-mailbox `autoDraftEnabled` to `false` to disable this behavior.
+- **Durable delivery** — Outbound mail is recorded in an Outbox before it is queued. Queue retries use a stable operation ID and Message-ID; delivery status is available from the API.
 - **Configurable and persistent** — Custom system prompts per mailbox, persistent chat history, streaming markdown responses, and tool call visibility
 
 ## Stack
@@ -47,6 +48,8 @@ Click the button above to deploy to your Cloudflare account. The deploy flow wil
 
 Auto-draft runs on inbound mail when `autoDraftEnabled` is not `false`. Each auto-draft attempt can call Workers AI for prompt-injection scanning, draft generation, and draft verification. Disable auto-draft per mailbox for high-volume addresses that should only be reviewed manually.
 
+The default `autoDraftMaxPerDay` is 50 and the configured maximum is 200. Auto-drafts are processed through a queue and deduplicated by mailbox and inbound email ID.
+
 ## Getting Started
 
 ```bash
@@ -57,12 +60,17 @@ npm run dev
 ### Configuration
 
 1. Set your domain in `wrangler.jsonc`
-2. Create an R2 bucket named `agentic-inbox`: `wrangler r2 bucket create agentic-inbox`
+2. Create the R2 buckets used by your selected environment, for example: `wrangler r2 bucket create agentic-inbox` and `wrangler r2 bucket create agentic-inbox-staging`
+3. Create the queues and dead-letter queues: `wrangler queues create agentic-inbox-outbound`, `wrangler queues create agentic-inbox-outbound-dlq`, `wrangler queues create agentic-inbox-auto-draft`, and `wrangler queues create agentic-inbox-auto-draft-dlq`
+4. Local development is dry-run by default (`DRY_RUN_EMAILS=true`). Set `DRY_RUN_EMAILS=false` only in the production environment after Email Service and routing have been verified.
 
 ### Deploy
 
 ```bash
 npm run deploy
+# or, for an explicit environment configuration
+wrangler deploy --env staging
+wrangler deploy --env production
 ```
 
 ## Prerequisites
@@ -74,6 +82,8 @@ npm run deploy
 - [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) configured for deployed/shared environments (recommended when exposing this app publicly)
 
 When Access is enabled, any user who passes the shared Cloudflare Access policy can access all mailboxes in this app by design. This includes the MCP server at `/mcp` -- external AI tools (Claude Code, Cursor, etc.) connected via MCP can operate on any mailbox by passing a `mailboxId` parameter. There is no per-mailbox authorization; the Cloudflare Access policy is the single trust boundary.
+
+This release intentionally keeps that single-operator/shared-Access model. Team-level mailbox ACLs, per-user ownership, and audit attribution are follow-up work; do not expose the deployment to a broader Access group until those controls are implemented.
 
 ## Architecture
 
@@ -87,8 +97,18 @@ When Access is enabled, any user who passes the shared Cloudflare Access policy 
        │ WebSocket   │                  │     │  (AIChatAgent)  │
        └─────────────┤                  │     │  9 email tools  │
                      │                  │────>│  Workers AI     │
-                     └──────────────────┘     └─────────────────┘
+└──────────────────┘     └─────────────────┘
 ```
+
+Outbound sends and auto-draft jobs are persisted in the mailbox Durable Object and dispatched through Cloudflare Queues. R2 object keys are stored with attachment metadata so cleanup does not depend on reconstructing filenames.
+
+## Verification
+
+```bash
+npm run verify
+```
+
+This runs Wrangler type validation, TypeScript, the production build (including React Router generation), and the unit test suite. The delivery model is at-least-once: provider-side duplicate suppression or operational reconciliation is still required if a worker crashes after the provider accepts a message but before the Outbox is marked `sent`.
 
 ## License
 

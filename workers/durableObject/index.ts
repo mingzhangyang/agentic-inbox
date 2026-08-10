@@ -10,6 +10,7 @@ import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { applyMigrations, mailboxMigrations } from "./migrations";
+import { deleteAttachmentObjects } from "../lib/attachments";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -34,6 +35,47 @@ const ALLOWED_SORT_COLUMNS = [
 ] as const;
 
 type SortColumn = (typeof ALLOWED_SORT_COLUMNS)[number];
+
+type SqlRow = Record<string, SqlStorageValue>;
+type EmailSqlRow = SqlRow & {
+	id: string;
+	read: number;
+	starred: number;
+	date: string | null;
+	thread_id: string | null;
+	folder_id: string;
+	body: string | null;
+};
+type AttachmentSqlRow = SqlRow & {
+	id: string;
+	email_id: string;
+	filename: string;
+};
+type ThreadedEmailRow = SqlRow & {
+	id: string;
+	subject: string | null;
+	sender: string | null;
+	recipient: string | null;
+	date: string | null;
+	read: number;
+	starred: number;
+	thread_id: string | null;
+	folder_id: string;
+	in_reply_to: string | null;
+	email_references: string | null;
+	snippet: string | null;
+	thread_count: number;
+	thread_unread_count: number;
+	participants: string | null;
+	needs_reply?: number;
+	has_draft?: number;
+};
+type ThreadCandidateRow = SqlRow & {
+	thread_id: string;
+	subject: string | null;
+	senders: string | null;
+	recipients: string | null;
+};
 
 /**
  * Map SortColumn string names to Drizzle column references for safe
@@ -80,6 +122,7 @@ interface EmailData {
 	bcc?: string | null;
 	date: string;
 	body: string;
+	body_format?: "html" | "text" | string | null;
 	read?: boolean;
 	starred?: boolean;
 	in_reply_to?: string | null;
@@ -87,6 +130,10 @@ interface EmailData {
 	thread_id?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
+	delivery_status?: string | null;
+	delivery_operation_id?: string | null;
+	source_draft_id?: string | null;
+	inbound_key?: string | null;
 }
 
 interface AttachmentData {
@@ -97,7 +144,16 @@ interface AttachmentData {
 	size: number;
 	content_id?: string | null;
 	disposition?: string | null;
+	object_key?: string | null;
 }
+
+export type DraftReplacementResult =
+	| { ok: true; id: string; date: string }
+	| { ok: false; reason: "not_found" | "not_draft" };
+
+export type OutboxClaimResult =
+	| { status: "missing" | "sent" | "failed" | "pending"; operationId: string }
+	| { status: "claimed"; operationId: string; emailId: string; attempts: number };
 
 export class MailboxDO extends DurableObject<Env> {
 	declare __DURABLE_OBJECT_BRAND: never;
@@ -106,7 +162,9 @@ export class MailboxDO extends DurableObject<Env> {
 	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
-		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+		this.ctx.blockConcurrencyWhile(async () => {
+			applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+		});
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────
@@ -237,7 +295,7 @@ export class MailboxDO extends DurableObject<Env> {
 		const isDraftFolder = folder === Folders.DRAFT;
 
 		if (isDraftFolder) {
-			const result = this.ctx.storage.sql.exec(
+			const result = this.ctx.storage.sql.exec<ThreadedEmailRow>(
 				`WITH
 				folder_emails AS (
 					SELECT *,
@@ -277,8 +335,8 @@ export class MailboxDO extends DurableObject<Env> {
 				folder, limit, offset
 			);
 
-			const rows = [...result];
-			return rows.map((row: any) => ({
+			const rows = result.toArray();
+			return rows.map((row) => ({
 				...row,
 				read: !!row.read,
 				starred: !!row.starred,
@@ -289,7 +347,7 @@ export class MailboxDO extends DurableObject<Env> {
 		}
 
 		// Non-draft folders: full threading logic
-		const result = this.ctx.storage.sql.exec(
+		const result = this.ctx.storage.sql.exec<ThreadedEmailRow>(
 			`WITH
 			folder_emails AS (
 				SELECT *,
@@ -304,7 +362,8 @@ export class MailboxDO extends DurableObject<Env> {
 					normalized_subject,
 					CASE
 						WHEN thread_id IS NOT NULL THEN raw_thread_id
-						ELSE MIN(raw_thread_id) OVER (PARTITION BY normalized_subject)
+						WHEN normalized_subject != '' THEN MIN(raw_thread_id) OVER (PARTITION BY normalized_subject)
+						ELSE raw_thread_id
 					END as conversation_id
 				FROM folder_emails
 				GROUP BY raw_thread_id, normalized_subject, thread_id
@@ -372,8 +431,8 @@ export class MailboxDO extends DurableObject<Env> {
 			folder, limit, offset
 		);
 
-		const rows = [...result];
-		return rows.map((row: any) => ({
+		const rows = result.toArray();
+		return rows.map((row) => ({
 			...row,
 			read: !!row.read,
 			starred: !!row.starred,
@@ -465,12 +524,10 @@ export class MailboxDO extends DurableObject<Env> {
 	 * N+1 individual getEmail calls.
 	 */
 	async getThreadEmails(threadId: string) {
-		const emailRows = [
-			...this.ctx.storage.sql.exec(
+		const emailRows = this.ctx.storage.sql.exec<EmailSqlRow>(
 				`SELECT * FROM emails WHERE thread_id = ?1 ORDER BY date ASC`,
 				threadId,
-			),
-		] as any[];
+			).toArray();
 
 		if (emailRows.length === 0) return [];
 
@@ -478,15 +535,13 @@ export class MailboxDO extends DurableObject<Env> {
 
 		// Batch-fetch all attachments for the thread in a single query
 		const placeholders = emailIds.map((_, i) => `?${i + 1}`).join(",");
-		const attachmentRows = [
-			...this.ctx.storage.sql.exec(
+		const attachmentRows = this.ctx.storage.sql.exec<AttachmentSqlRow>(
 				`SELECT * FROM attachments WHERE email_id IN (${placeholders})`,
 				...emailIds,
-			),
-		] as any[];
+			).toArray();
 
 		// Group attachments by email_id
-		const attachmentsByEmail = new Map<string, any[]>();
+		const attachmentsByEmail = new Map<string, AttachmentSqlRow[]>();
 		for (const att of attachmentRows) {
 			const list = attachmentsByEmail.get(att.email_id) || [];
 			list.push(att);
@@ -546,16 +601,31 @@ export class MailboxDO extends DurableObject<Env> {
 		const emailAttachments = this.db
 			.select({
 				id: schema.attachments.id,
+				email_id: schema.attachments.email_id,
 				filename: schema.attachments.filename,
+				object_key: schema.attachments.object_key,
 			})
 			.from(schema.attachments)
 			.where(eq(schema.attachments.email_id, id))
 			.all();
 
-		this.db
-			.delete(schema.emails)
-			.where(eq(schema.emails.id, id))
-			.run();
+		// Delete external blobs before removing the database record. If R2 is
+		// unavailable, the email remains retryable and its attachment metadata
+		// is not lost.
+		if (emailAttachments.length > 0) {
+			await deleteAttachmentObjects(this.env.BUCKET, emailAttachments);
+		}
+
+		this.ctx.storage.transactionSync(() => {
+			this.db
+				.delete(schema.emails)
+				.where(eq(schema.emails.id, id))
+				.run();
+			this.db
+				.delete(schema.agentJobs)
+				.where(eq(schema.agentJobs.email_id, id))
+				.run();
+		});
 
 		return emailAttachments;
 	}
@@ -714,8 +784,8 @@ export class MailboxDO extends DurableObject<Env> {
 			ORDER BY e.date DESC LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`;
 		params.push(limit, offset);
 
-		const result = this.ctx.storage.sql.exec(query, ...params);
-		return [...result].map((row: any) => ({
+		const result = this.ctx.storage.sql.exec<SqlRow>(query, ...params);
+		return result.toArray().map((row) => ({
 			...row,
 			read: !!row.read,
 			starred: !!row.starred,
@@ -747,7 +817,7 @@ export class MailboxDO extends DurableObject<Env> {
 
 		if (!normalized) return null;
 
-		const result = this.ctx.storage.sql.exec(
+		const result = this.ctx.storage.sql.exec<ThreadCandidateRow>(
 			`SELECT thread_id, subject,
 			        GROUP_CONCAT(DISTINCT LOWER(sender)) as senders,
 			        GROUP_CONCAT(DISTINCT LOWER(recipient)) as recipients
@@ -763,22 +833,25 @@ export class MailboxDO extends DurableObject<Env> {
 		const normalizedSender = senderAddress?.toLowerCase().trim();
 
 		for (const row of result) {
-			const rowSubject = String((row as any).subject || "")
+			const rowSubject = String(row.subject || "")
 				.replace(/^(?:(?:re|fwd?|fw|aw|wg|r[eé]f|sv)\s*:\s*)+/i, "")
 				.trim()
 				.toLowerCase();
 			if (rowSubject !== normalized) continue;
 
 			if (normalizedSender) {
-				const threadSenders = String((row as any).senders || "");
-				const threadRecipients = String((row as any).recipients || "");
-				const allParticipants = `${threadSenders},${threadRecipients}`;
+				const threadSenders = String(row.senders || "");
+				const threadRecipients = String(row.recipients || "");
+				const allParticipants = `${threadSenders},${threadRecipients}`
+					.split(",")
+					.map((participant) => participant.trim())
+					.filter(Boolean);
 				if (!allParticipants.includes(normalizedSender)) {
 					continue;
 				}
 			}
 
-			return String((row as any).thread_id);
+			return String(row.thread_id);
 		}
 		return null;
 	}
@@ -791,29 +864,118 @@ export class MailboxDO extends DurableObject<Env> {
 	 * Returns null if under limit, or an error message string if exceeded.
 	 */
 	async checkSendRateLimit(): Promise<string | null> {
-		const hourRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
-			 WHERE folder_id = ?1
-			   AND date >= datetime('now', '-1 hour')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
+		const now = Date.now();
+		return this.ctx.storage.transactionSync(() => {
+			const hour = this.db.select().from(schema.rateLimits).where(eq(schema.rateLimits.key, "send:hour")).get();
+			const day = this.db.select().from(schema.rateLimits).where(eq(schema.rateLimits.key, "send:day")).get();
+			const hourActive = hour && now - hour.window_start < 60 * 60 * 1000;
+			const dayActive = day && now - day.window_start < 24 * 60 * 60 * 1000;
+			if (hourActive && hour.count >= 20) return "Rate limit exceeded: max 20 emails per hour per mailbox";
+			if (dayActive && day.count >= 100) return "Rate limit exceeded: max 100 emails per day per mailbox";
 
-		if ((hourRow?.cnt ?? 0) >= 20) {
-			return "Rate limit exceeded: max 20 emails per hour per mailbox";
+			const increment = (key: string, row: typeof hour, active: boolean) => {
+				const count = active && row ? row.count + 1 : 1;
+				this.db.insert(schema.rateLimits)
+					.values({ key, window_start: now, count })
+					.onConflictDoUpdate({
+						target: schema.rateLimits.key,
+						set: { window_start: now, count },
+					})
+					.run();
+			};
+			increment("send:hour", hour, Boolean(hourActive));
+			increment("send:day", day, Boolean(dayActive));
+			return null;
+		});
+	}
+
+	/** Atomically consume a mailbox-scoped sliding window counter. */
+	async checkRateLimit(kind: string, limit: number, windowSeconds: number): Promise<boolean> {
+		const now = Date.now();
+		const windowMs = windowSeconds * 1000;
+		return this.ctx.storage.transactionSync(() => {
+			const row = this.db
+				.select()
+				.from(schema.rateLimits)
+				.where(eq(schema.rateLimits.key, kind))
+				.get();
+			if (!row || now - row.window_start >= windowMs) {
+				this.db
+					.insert(schema.rateLimits)
+					.values({ key: kind, window_start: now, count: 1 })
+					.onConflictDoUpdate({
+						target: schema.rateLimits.key,
+						set: { window_start: now, count: 1 },
+					})
+					.run();
+				return true;
+			}
+			if (row.count >= limit) return false;
+			this.db
+				.update(schema.rateLimits)
+				.set({ count: row.count + 1 })
+				.where(eq(schema.rateLimits.key, kind))
+				.run();
+			return true;
+		});
+	}
+
+	async claimAutoDraftJob(emailId: string, mailboxId: string, maxAttempts = 5): Promise<"claimed" | "pending" | "done" | "failed"> {
+		return this.ctx.storage.transactionSync(() => {
+			const now = Date.now();
+			const row = this.db.select().from(schema.agentJobs).where(eq(schema.agentJobs.email_id, emailId)).get();
+			if (!row) {
+				this.db.insert(schema.agentJobs).values({ email_id: emailId, mailbox_id: mailboxId, status: "processing", attempts: 1, lease_until: now + 10 * 60 * 1000, updated_at: now }).run();
+				return "claimed";
+			}
+			if (row.status === "done") return "done";
+			if (row.status === "failed" && row.attempts >= maxAttempts) return "failed";
+			if (row.status === "processing" && row.lease_until && row.lease_until > now) return "pending";
+			if (row.attempts >= maxAttempts) {
+				this.db.update(schema.agentJobs).set({ status: "failed", updated_at: now }).where(eq(schema.agentJobs.email_id, emailId)).run();
+				return "failed";
+			}
+			this.db.update(schema.agentJobs).set({ status: "processing", attempts: row.attempts + 1, lease_until: now + 10 * 60 * 1000, updated_at: now }).where(eq(schema.agentJobs.email_id, emailId)).run();
+			return "claimed";
+		});
+	}
+
+	async completeAutoDraftJob(emailId: string) {
+		this.db.update(schema.agentJobs).set({ status: "done", lease_until: null, updated_at: Date.now() }).where(eq(schema.agentJobs.email_id, emailId)).run();
+	}
+
+	async failAutoDraftJob(emailId: string, error: string, maxAttempts = 5): Promise<{ retry: boolean }> {
+		let shouldScheduleRetry = false;
+		const result = this.ctx.storage.transactionSync(() => {
+			const row = this.db.select({ attempts: schema.agentJobs.attempts }).from(schema.agentJobs).where(eq(schema.agentJobs.email_id, emailId)).get();
+			if (!row) return { retry: false };
+			const retry = row.attempts < maxAttempts;
+			shouldScheduleRetry = retry;
+			this.db.update(schema.agentJobs).set({ status: retry ? "queued" : "failed", lease_until: null, updated_at: Date.now() }).where(eq(schema.agentJobs.email_id, emailId)).run();
+			if (!retry) console.error(JSON.stringify({ event: "auto_draft_failed", emailId, error: error.slice(0, 500) }));
+			return { retry };
+		});
+		if (shouldScheduleRetry) await this.ctx.storage.setAlarm(Date.now() + 10_000);
+		return result;
+	}
+
+	/** Persist a fallback auto-draft job when Queue submission itself fails. */
+	async scheduleAutoDraftRetry(emailId: string, mailboxId: string, delayMs = 1_000) {
+		const now = Date.now();
+		const active = this.db
+			.select({ status: schema.agentJobs.status, leaseUntil: schema.agentJobs.lease_until })
+			.from(schema.agentJobs)
+			.where(eq(schema.agentJobs.email_id, emailId))
+			.get();
+		if (!(active?.status === "processing" && active.leaseUntil && active.leaseUntil > now)) {
+			this.db.insert(schema.agentJobs).values({ email_id: emailId, mailbox_id: mailboxId, status: "queued", attempts: 0, lease_until: null, updated_at: now })
+				.onConflictDoUpdate({
+					target: schema.agentJobs.email_id,
+					set: { status: "queued", lease_until: null, updated_at: now },
+				})
+				.run();
 		}
-
-		const dayRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
-			 WHERE folder_id = ?1
-			   AND date >= datetime('now', '-1 day')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
-
-		if ((dayRow?.cnt ?? 0) >= 100) {
-			return "Rate limit exceeded: max 100 emails per day per mailbox";
-		}
-
-		return null;
+		await this.ctx.storage.setAlarm(now + delayMs);
 	}
 
 	// ── Mailbox lifecycle ─────────────────────────────────────────────
@@ -822,12 +984,13 @@ export class MailboxDO extends DurableObject<Env> {
 	 * Return all attachment records before mailbox deletion so the route
 	 * handler can remove R2 blobs before destroying this DO's storage.
 	 */
-	async listAttachmentKeys(): Promise<{ emailId: string; attachmentId: string; filename: string }[]> {
+	async listAttachmentKeys(): Promise<{ emailId: string; attachmentId: string; filename: string; objectKey: string | null }[]> {
 		const attachments = this.db
 			.select({
 				email_id: schema.attachments.email_id,
 				id: schema.attachments.id,
 				filename: schema.attachments.filename,
+				object_key: schema.attachments.object_key,
 			})
 			.from(schema.attachments)
 			.all();
@@ -836,6 +999,7 @@ export class MailboxDO extends DurableObject<Env> {
 			emailId: a.email_id,
 			attachmentId: a.id,
 			filename: a.filename,
+			objectKey: a.object_key,
 		}));
 	}
 
@@ -850,7 +1014,276 @@ export class MailboxDO extends DurableObject<Env> {
 		email: EmailData,
 		attachments: AttachmentData[],
 	) {
-		this.insertEmail(folder, email, attachments);
+		this.ctx.storage.transactionSync(() => this.insertEmail(folder, email, attachments));
+	}
+
+	async createInboundEmail(
+		email: EmailData,
+		attachments: AttachmentData[],
+	): Promise<{ duplicate: boolean; id: string }> {
+		if (email.inbound_key) {
+			const existing = this.db
+				.select({ id: schema.emails.id })
+				.from(schema.emails)
+				.where(eq(schema.emails.inbound_key, email.inbound_key))
+				.get();
+			if (existing) return { duplicate: true, id: existing.id };
+		}
+		this.ctx.storage.transactionSync(() => this.insertEmail(Folders.INBOX, email, attachments));
+		return { duplicate: false, id: email.id };
+	}
+
+	async hasInboundEmail(inboundKey: string): Promise<boolean> {
+		return Boolean(this.db
+			.select({ id: schema.emails.id })
+			.from(schema.emails)
+			.where(eq(schema.emails.inbound_key, inboundKey))
+			.get());
+	}
+
+	async getOutboundByIdempotencyKey(idempotencyKey: string) {
+		return this.db
+			.select({
+				operationId: schema.outbox.operation_id,
+				emailId: schema.outbox.email_id,
+				payloadHash: schema.outbox.payload_hash,
+				status: schema.outbox.status,
+			})
+			.from(schema.outbox)
+			.where(eq(schema.outbox.idempotency_key, idempotencyKey))
+			.get() ?? null;
+	}
+
+	async createOutboundEmail(
+		mailboxId: string,
+		email: EmailData,
+		attachments: AttachmentData[],
+		operationId: string,
+		idempotencyKey: string,
+		payloadHash: string,
+		sourceDraftId?: string | null,
+	): Promise<
+		| { ok: true; created: boolean; operationId: string; emailId: string; status: string }
+		| { ok: false; reason: "idempotency_conflict" | "source_draft_not_found" | "source_not_draft" }
+	> {
+		const existing = this.db
+			.select({
+				operationId: schema.outbox.operation_id,
+				emailId: schema.outbox.email_id,
+				payloadHash: schema.outbox.payload_hash,
+				status: schema.outbox.status,
+			})
+			.from(schema.outbox)
+			.where(eq(schema.outbox.idempotency_key, idempotencyKey))
+			.get();
+		if (existing) {
+			if (existing.payloadHash !== payloadHash) return { ok: false, reason: "idempotency_conflict" };
+			return { ok: true, created: false, operationId: existing.operationId, emailId: existing.emailId, status: existing.status };
+		}
+
+		const now = Date.now();
+		let result: { ok: true; created: boolean; operationId: string; emailId: string; status: string } | { ok: false; reason: "source_draft_not_found" | "source_not_draft" } = {
+			ok: true,
+			created: true,
+			operationId,
+			emailId: email.id,
+			status: "queued",
+		};
+		this.ctx.storage.transactionSync(() => {
+			if (sourceDraftId) {
+				const source = this.db
+					.select({ folderId: schema.emails.folder_id })
+					.from(schema.emails)
+					.where(eq(schema.emails.id, sourceDraftId))
+					.get();
+				if (!source) {
+					result = { ok: false, reason: "source_draft_not_found" };
+					return;
+				}
+				if (source.folderId !== Folders.DRAFT) {
+					result = { ok: false, reason: "source_not_draft" };
+					return;
+				}
+			}
+
+			this.insertEmail(Folders.SENT, {
+				...email,
+				delivery_status: "queued",
+				delivery_operation_id: operationId,
+				source_draft_id: sourceDraftId ?? null,
+			}, attachments);
+			this.db.insert(schema.outbox).values({
+				operation_id: operationId,
+				mailbox_id: mailboxId,
+				email_id: email.id,
+				idempotency_key: idempotencyKey,
+				payload_hash: payloadHash,
+				status: "queued",
+				attempts: 0,
+				lease_until: null,
+				next_attempt_at: null,
+				provider_message_id: null,
+				last_error: null,
+				created_at: now,
+				updated_at: now,
+			}).run();
+		});
+		return result;
+	}
+
+	async getOutboundStatus(operationId: string) {
+		return this.db
+			.select({
+				operationId: schema.outbox.operation_id,
+				emailId: schema.outbox.email_id,
+				status: schema.outbox.status,
+				attempts: schema.outbox.attempts,
+				providerMessageId: schema.outbox.provider_message_id,
+				lastError: schema.outbox.last_error,
+				updatedAt: schema.outbox.updated_at,
+			})
+			.from(schema.outbox)
+			.where(eq(schema.outbox.operation_id, operationId))
+			.get() ?? null;
+	}
+
+	async claimOutboundDelivery(operationId: string, maxAttempts = 5): Promise<OutboxClaimResult> {
+		return this.ctx.storage.transactionSync(() => {
+			const row = this.db
+				.select({
+					status: schema.outbox.status,
+					emailId: schema.outbox.email_id,
+					attempts: schema.outbox.attempts,
+					leaseUntil: schema.outbox.lease_until,
+				})
+				.from(schema.outbox)
+				.where(eq(schema.outbox.operation_id, operationId))
+				.get();
+			if (!row) return { status: "missing", operationId };
+			if (row.status === "sent") return { status: "sent", operationId };
+			if (row.status === "failed") return { status: "failed", operationId };
+			const now = Date.now();
+			if (row.leaseUntil && row.leaseUntil > now) return { status: "pending", operationId };
+			if (row.attempts >= maxAttempts) {
+				this.db.update(schema.outbox).set({ status: "failed", updated_at: now, last_error: "Maximum delivery attempts exceeded" }).where(eq(schema.outbox.operation_id, operationId)).run();
+				this.db.update(schema.emails).set({ delivery_status: "failed" }).where(eq(schema.emails.id, row.emailId)).run();
+				return { status: "failed", operationId };
+			}
+			const attempts = row.attempts + 1;
+			this.db.update(schema.outbox).set({
+				status: "processing",
+				attempts,
+				lease_until: now + 5 * 60 * 1000,
+				updated_at: now,
+				next_attempt_at: null,
+			}).where(eq(schema.outbox.operation_id, operationId)).run();
+			return { status: "claimed", operationId, emailId: row.emailId, attempts };
+		});
+	}
+
+	async completeOutboundDelivery(operationId: string, providerMessageId: string): Promise<{ ok: boolean; draftAttachments: AttachmentData[] }> {
+		return this.ctx.storage.transactionSync(() => {
+			const row = this.db
+				.select({ emailId: schema.outbox.email_id, status: schema.outbox.status })
+				.from(schema.outbox)
+				.where(eq(schema.outbox.operation_id, operationId))
+				.get();
+			if (!row) return { ok: false, draftAttachments: [] };
+			if (row.status === "sent") return { ok: true, draftAttachments: [] };
+			const sent = this.db
+				.select({ sourceDraftId: schema.emails.source_draft_id })
+				.from(schema.emails)
+				.where(eq(schema.emails.id, row.emailId))
+				.get();
+			let draftAttachments: AttachmentData[] = [];
+			if (sent?.sourceDraftId) {
+				const draft = this.db
+					.select({ folderId: schema.emails.folder_id })
+					.from(schema.emails)
+					.where(eq(schema.emails.id, sent.sourceDraftId))
+					.get();
+				if (draft?.folderId === Folders.DRAFT) {
+					draftAttachments = this.db
+						.select()
+						.from(schema.attachments)
+						.where(eq(schema.attachments.email_id, sent.sourceDraftId))
+						.all() as AttachmentData[];
+					this.db.delete(schema.emails).where(eq(schema.emails.id, sent.sourceDraftId)).run();
+				}
+			}
+			const now = Date.now();
+			this.db.update(schema.outbox).set({ status: "sent", provider_message_id: providerMessageId, lease_until: null, updated_at: now, last_error: null }).where(eq(schema.outbox.operation_id, operationId)).run();
+			this.db.update(schema.emails).set({ delivery_status: "sent" }).where(eq(schema.emails.id, row.emailId)).run();
+			return { ok: true, draftAttachments };
+		});
+	}
+
+	async failOutboundDelivery(operationId: string, error: string, maxAttempts = 5): Promise<{ retry: boolean; attempts: number }> {
+		let retryAt: number | null = null;
+		const result = this.ctx.storage.transactionSync(() => {
+			const row = this.db
+				.select({ attempts: schema.outbox.attempts, emailId: schema.outbox.email_id })
+				.from(schema.outbox)
+				.where(eq(schema.outbox.operation_id, operationId))
+				.get();
+			if (!row) return { retry: false, attempts: 0 };
+			const retry = row.attempts < maxAttempts;
+			const now = Date.now();
+			retryAt = retry ? now + Math.min(60_000, 2 ** row.attempts * 1_000) : null;
+			this.db.update(schema.outbox).set({
+				status: retry ? "queued" : "failed",
+				lease_until: null,
+				next_attempt_at: retryAt,
+				last_error: error.slice(0, 1_000),
+				updated_at: now,
+			}).where(eq(schema.outbox.operation_id, operationId)).run();
+			this.db.update(schema.emails).set({ delivery_status: retry ? "queued" : "failed" }).where(eq(schema.emails.id, row.emailId)).run();
+			return { retry, attempts: row.attempts };
+		});
+		if (retryAt !== null) await this.ctx.storage.setAlarm(retryAt);
+		return result;
+	}
+
+	async scheduleOutboundRetry(operationId: string, delayMs = 1_000) {
+		const nextAttemptAt = Date.now() + delayMs;
+		this.db.update(schema.outbox).set({ status: "queued", next_attempt_at: nextAttemptAt, updated_at: Date.now() }).where(eq(schema.outbox.operation_id, operationId)).run();
+		await this.ctx.storage.setAlarm(nextAttemptAt);
+	}
+
+	async alarm() {
+		const rows = [...this.ctx.storage.sql.exec(
+			`SELECT operation_id, mailbox_id FROM outbox WHERE status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) LIMIT 20`,
+			Date.now(),
+		)] as Array<{ operation_id: string; mailbox_id: string }>;
+		for (const row of rows) {
+			try {
+				await this.env.OUTBOUND_QUEUE.send({ mailboxId: row.mailbox_id, operationId: row.operation_id });
+				this.ctx.storage.sql.exec(`UPDATE outbox SET next_attempt_at = NULL, updated_at = ?1 WHERE operation_id = ?2`, Date.now(), row.operation_id);
+			} catch {
+				await this.ctx.storage.setAlarm(Date.now() + 30_000);
+			}
+		}
+		if (rows.length >= 20) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+
+		const autoDraftRows = [...this.ctx.storage.sql.exec(
+			`SELECT j.email_id, j.mailbox_id, e.sender, e.subject, e.thread_id
+			 FROM agent_jobs j JOIN emails e ON e.id = j.email_id
+			 WHERE j.status = 'queued' ORDER BY j.updated_at ASC LIMIT 20`,
+		)] as Array<{ email_id: string; mailbox_id: string; sender: string | null; subject: string | null; thread_id: string | null }>;
+		for (const row of autoDraftRows) {
+			try {
+				await this.env.AUTO_DRAFT_QUEUE.send({
+					mailboxId: row.mailbox_id,
+					emailId: row.email_id,
+					sender: row.sender || "",
+					subject: row.subject || "",
+					threadId: row.thread_id || row.email_id,
+				});
+			} catch {
+				await this.ctx.storage.setAlarm(Date.now() + 30_000);
+			}
+		}
+		if (autoDraftRows.length >= 20) await this.ctx.storage.setAlarm(Date.now() + 1_000);
 	}
 
 	/**
@@ -862,14 +1295,31 @@ export class MailboxDO extends DurableObject<Env> {
 		oldDraftId: string | null,
 		email: EmailData,
 		attachments: AttachmentData[],
-	): Promise<{ id: string; date: string }> {
+	): Promise<DraftReplacementResult> {
+		let result: DraftReplacementResult = { ok: true, id: email.id, date: email.date };
 		this.ctx.storage.transactionSync(() => {
 			if (oldDraftId) {
+				const existing = this.db
+					.select({ folderId: schema.emails.folder_id })
+					.from(schema.emails)
+					.where(eq(schema.emails.id, oldDraftId))
+					.get();
+				if (!existing) {
+					result = { ok: false, reason: "not_found" };
+					return;
+				}
+				if (existing.folderId !== Folders.DRAFT) {
+					result = { ok: false, reason: "not_draft" };
+					return;
+				}
 				this.db.delete(schema.emails).where(eq(schema.emails.id, oldDraftId)).run();
+				this.insertEmail(Folders.DRAFT, { ...email, id: oldDraftId }, attachments);
+				result = { ok: true, id: oldDraftId, date: email.date };
+				return;
 			}
 			this.insertEmail(Folders.DRAFT, email, attachments);
 		});
-		return { id: email.id, date: email.date };
+		return result;
 	}
 
 	private insertEmail(
@@ -909,16 +1359,24 @@ export class MailboxDO extends DurableObject<Env> {
 				read: isSent ? 1 : (email.read ? 1 : 0),
 				starred: email.starred ? 1 : 0,
 				body: email.body,
+				body_format: email.body_format === "text" ? "text" : "html",
 				in_reply_to: email.in_reply_to ?? null,
 				email_references: email.email_references ?? null,
 				thread_id: email.thread_id ?? null,
 				message_id: email.message_id ?? null,
 				raw_headers: email.raw_headers ?? null,
+				delivery_status: email.delivery_status ?? (isSent ? "sent" : "received"),
+				delivery_operation_id: email.delivery_operation_id ?? null,
+				source_draft_id: email.source_draft_id ?? null,
+				inbound_key: email.inbound_key ?? null,
 			})
 			.run();
 
 		if (attachments.length > 0) {
-			this.db.insert(schema.attachments).values(attachments).run();
+			this.db.insert(schema.attachments).values(attachments.map((attachment) => ({
+				...attachment,
+				object_key: attachment.object_key ?? null,
+			}))).run();
 		}
 	}
 }

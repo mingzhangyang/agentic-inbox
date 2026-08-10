@@ -9,6 +9,8 @@ import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
+import { processOutboundMessage, type OutboundQueueMessage } from "./lib/outbox";
+import { processAutoDraftMessage, type AutoDraftQueueMessage } from "./lib/agent-jobs";
 
 export { MailboxDO } from "./durableObject";
 export { EmailAgent } from "./agent";
@@ -162,6 +164,19 @@ export default {
 			// Re-throw so Cloudflare's email routing can retry delivery or bounce the message.
 			// Swallowing the error would silently drop the email.
 			throw e;
+		}
+	},
+	async queue(
+		batch: MessageBatch<OutboundQueueMessage | AutoDraftQueueMessage>,
+		env: Env,
+		_ctx: ExecutionContext,
+	) {
+		for (const message of batch.messages) {
+			if (batch.queue === "agentic-inbox-auto-draft") {
+				await processAutoDraftMessage(message as Message<AutoDraftQueueMessage>, env);
+			} else {
+				await processOutboundMessage(message as Message<OutboundQueueMessage>, env);
+			}
 		}
 	},
 };

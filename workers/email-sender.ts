@@ -41,10 +41,43 @@ export async function sendEmail(
 	binding: SendEmail,
 	params: SendEmailParams,
 ): Promise<{ messageId: string }> {
-	const message: Record<string, unknown> = {
+	type EmailSendOptions = {
+		to: string | string[];
+		from: string | { email: string; name: string };
+		subject: string;
+		html?: string;
+		text?: string;
+		cc?: string | string[];
+		bcc?: string | string[];
+		replyTo?: string | { email: string; name: string };
+		attachments?: EmailAttachment[];
+		headers?: Record<string, string>;
+	};
+
+	const emailAttachments: EmailAttachment[] = (params.attachments ?? []).map((attachment) => {
+		if (attachment.disposition === "inline") {
+			if (!attachment.contentId) throw new Error(`Inline attachment ${attachment.filename} is missing a content ID`);
+			return {
+				content: attachment.content,
+				filename: attachment.filename,
+				type: attachment.type,
+				disposition: "inline" as const,
+				contentId: attachment.contentId,
+			};
+		}
+		return {
+			content: attachment.content,
+			filename: attachment.filename,
+			type: attachment.type,
+			disposition: "attachment" as const,
+		};
+	});
+
+	const message: EmailSendOptions = {
 		to: params.to,
 		from: params.from,
 		subject: params.subject,
+		...(emailAttachments.length > 0 ? { attachments: emailAttachments } : {}),
 	};
 
 	if (params.html) message.html = params.html;
@@ -57,16 +90,6 @@ export async function sendEmail(
 		message.headers = params.headers;
 	}
 
-	if (params.attachments && params.attachments.length > 0) {
-		message.attachments = params.attachments.map((att) => ({
-			content: att.content,
-			filename: att.filename,
-			type: att.type,
-			disposition: att.disposition,
-			...(att.contentId ? { contentId: att.contentId } : {}),
-		}));
-	}
-
-	const result = await binding.send(message as any);
+	const result = await binding.send(message);
 	return { messageId: result.messageId };
 }

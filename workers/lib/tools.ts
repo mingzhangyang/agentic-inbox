@@ -24,24 +24,11 @@ import {
 	listMailboxes,
 	generateMessageId,
 	buildReferencesChain,
-	buildThreadingHeaders,
 } from "./email-helpers";
 import { verifyDraft } from "./ai";
-import { sendEmail } from "../email-sender";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
-
-// ── Type casts for DO methods not on the base stub type ────────────
-type MailboxSearchStub = {
-	searchEmails: (options: {
-		query: string;
-		folder?: string;
-	}) => Promise<unknown>;
-};
-
-type RateLimitStub = {
-	checkSendRateLimit: () => Promise<string | null>;
-};
+import { enqueueOutboundEmail, hashPayload } from "./outbox";
 
 // ── list_mailboxes ─────────────────────────────────────────────────
 
@@ -98,7 +85,7 @@ export async function toolSearchEmails(
 	params: { query: string; folder?: string },
 ) {
 	const stub = getMailboxStub(env, mailboxId);
-	return (stub as unknown as MailboxSearchStub).searchEmails({
+	return stub.searchEmails({
 		query: params.query,
 		folder: params.folder,
 	});
@@ -300,7 +287,7 @@ export async function toolUpdateDraft(
 		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
 	}
 
-	await stub.replaceDraft(
+	const result = await stub.replaceDraft(
 		params.draftId,
 		{
 			id: newDraftId,
@@ -315,10 +302,11 @@ export async function toolUpdateDraft(
 		},
 		[],
 	);
+	if (!result.ok) return { error: result.reason === "not_draft" ? "Cannot update: email is not a draft" : "Draft not found" };
 
 	return {
 		status: "draft_updated",
-		newDraftId,
+		newDraftId: result.id,
 		oldDraftId: params.draftId,
 		message: "Draft updated in Drafts folder.",
 	};
@@ -399,16 +387,10 @@ export async function toolSendReply(
 		bodyHtml: string;
 	},
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| { status: "queued"; messageId: string; operationId: string; message: string }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
-
-	// Check send rate limit
-	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
-	if (rateLimitError) {
-		return { error: rateLimitError };
-	}
 
 	const originalEmail = (await stub.getEmail(params.originalEmailId)) as EmailFull | null;
 	if (!originalEmail) {
@@ -432,38 +414,33 @@ export async function toolSendReply(
 	});
 	const fullBodyHtml = sanitizedBody + quotedBlock;
 
-	try {
-		await sendEmail(env.EMAIL, {
-			to: params.to,
-			from: mailboxId,
-			subject: params.subject,
-			html: fullBodyHtml,
-			headers: buildThreadingHeaders(originalMsgId, references),
-		});
-	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send reply: ${(e as Error).message}` };
+	const operationId = crypto.randomUUID();
+	const payloadHash = await hashPayload({ originalEmailId: params.originalEmailId, to: params.to, subject: params.subject, bodyHtml: fullBodyHtml });
+	const idempotencyKey = `tool:reply:${payloadHash}`;
+	const existing = await stub.getOutboundByIdempotencyKey(idempotencyKey);
+	if (existing) {
+		if (existing.payloadHash !== payloadHash) return { error: "Idempotency key conflict" };
+		return { status: "queued", messageId: existing.emailId, operationId: existing.operationId, message: `Reply queued for ${params.to}` };
 	}
-
-	await stub.createEmail(
-		Folders.SENT,
-		{
+	const rateLimitError = await stub.checkSendRateLimit();
+	if (rateLimitError) return { error: rateLimitError };
+	const created = await stub.createOutboundEmail(mailboxId, {
 			id: messageId,
 			subject: params.subject,
 			sender: mailboxId.toLowerCase(),
 			recipient: params.to.toLowerCase(),
 			date: new Date().toISOString(),
 			body: fullBodyHtml,
+			body_format: "html",
 			in_reply_to: originalMsgId,
 			email_references:
 				references.length > 0 ? JSON.stringify(references) : null,
 			thread_id: threadId,
 			message_id: outgoingMessageId,
-		},
-		[],
-	);
-
-	return { status: "sent", messageId, message: `Reply sent to ${params.to}` };
+		}, [], operationId, idempotencyKey, payloadHash);
+	if (!created.ok) return { error: "Unable to create outbound operation" };
+	if (created.created) await enqueueOutboundEmail(env, mailboxId, created.operationId, stub);
+	return { status: "queued", messageId: created.emailId, operationId: created.operationId, message: `Reply queued for ${params.to}` };
 }
 
 // ── send_email ─────────────────────────────────────────────────────
@@ -477,16 +454,10 @@ export async function toolSendEmail(
 		bodyHtml: string;
 	},
 ): Promise<
-	| { status: "sent"; messageId: string; message: string }
+	| { status: "queued"; messageId: string; operationId: string; message: string }
 	| { error: string }
 > {
 	const stub = getMailboxStub(env, mailboxId);
-
-	// Check send rate limit
-	const rateLimitError = await (stub as unknown as RateLimitStub).checkSendRateLimit();
-	if (rateLimitError) {
-		return { error: rateLimitError };
-	}
 
 	const fromDomain = mailboxId.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
@@ -497,34 +468,30 @@ export async function toolSendEmail(
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
 
-	try {
-		await sendEmail(env.EMAIL, {
-			to: params.to,
-			from: mailboxId,
-			subject: params.subject,
-			html: sanitizedBody,
-		});
-	} catch (e) {
-		console.error("Email send failed:", (e as Error).message);
-		return { error: `Failed to send email: ${(e as Error).message}` };
+	const operationId = crypto.randomUUID();
+	const payloadHash = await hashPayload({ to: params.to, subject: params.subject, bodyHtml: sanitizedBody });
+	const idempotencyKey = `tool:email:${payloadHash}`;
+	const existing = await stub.getOutboundByIdempotencyKey(idempotencyKey);
+	if (existing) {
+		if (existing.payloadHash !== payloadHash) return { error: "Idempotency key conflict" };
+		return { status: "queued", messageId: existing.emailId, operationId: existing.operationId, message: `Email queued for ${params.to}` };
 	}
-
-	await stub.createEmail(
-		Folders.SENT,
-		{
+	const rateLimitError = await stub.checkSendRateLimit();
+	if (rateLimitError) return { error: rateLimitError };
+	const created = await stub.createOutboundEmail(mailboxId, {
 			id: messageId,
 			subject: params.subject,
 			sender: mailboxId.toLowerCase(),
 			recipient: params.to.toLowerCase(),
 			date: new Date().toISOString(),
 			body: sanitizedBody,
+			body_format: "html",
 			in_reply_to: null,
 			email_references: null,
 			thread_id: messageId,
 			message_id: outgoingMessageId,
-		},
-		[],
-	);
-
-	return { status: "sent", messageId, message: `Email sent to ${params.to}` };
+		}, [], operationId, idempotencyKey, payloadHash);
+	if (!created.ok) return { error: "Unable to create outbound operation" };
+	if (created.created) await enqueueOutboundEmail(env, mailboxId, created.operationId, stub);
+	return { status: "queued", messageId: created.emailId, operationId: created.operationId, message: `Email queued for ${params.to}` };
 }

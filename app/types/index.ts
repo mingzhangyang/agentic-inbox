@@ -14,6 +14,7 @@ export interface MailboxSettings {
 	signature?: SignatureSettings;
 	autoReply?: { enabled: boolean; subject: string; message: string };
 	agentSystemPrompt?: string;
+	autoDraftMaxPerDay?: number;
 }
 
 export interface Mailbox {
@@ -36,6 +37,9 @@ export interface Email {
 	read: boolean;
 	starred: boolean;
 	body?: string | null;
+	body_format?: "html" | "text" | string | null;
+	delivery_status?: string | null;
+	delivery_operation_id?: string | null;
 	in_reply_to?: string | null;
 	email_references?: string | null;
 	message_id?: string | null;
@@ -57,6 +61,7 @@ export interface Attachment {
 	size: number;
 	content_id?: string;
 	disposition?: string;
+	object_key?: string | null;
 }
 
 export interface Folder {

@@ -62,7 +62,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 		const cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
 			FORBID_TAGS: ["style"],
-			ADD_ATTR: ["target"],
+			ADD_ATTR: ["target", "rel"],
 			FORCE_BODY: true,
 		});
 
@@ -91,7 +91,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid: https:; script-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:; script-src 'unsafe-inline';">
 <style>
 * { box-sizing: border-box; }
 html {
@@ -144,7 +144,7 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 			ref={iframeRef}
 			className="block w-full border-0"
 			style={autoSize ? { height: `${height}px` } : { height: "100%" }}
-			sandbox="allow-scripts allow-popups allow-top-navigation-by-user-activation"
+			sandbox="allow-scripts"
 			title="Email content"
 		/>
 	);

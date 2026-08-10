@@ -2,13 +2,14 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { AIChatAgent } from "@cloudflare/ai-chat";
+import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
 	streamText,
 	generateText,
 	convertToModelMessages,
 	stepCountIs,
 } from "ai";
+import type { StreamTextOnFinishCallback, ToolSet } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 import type { EmailFull, EmailMetadata } from "../lib/schemas";
@@ -32,12 +33,17 @@ import {
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 
+const MAX_AUTO_EMAIL_CONTEXT = 16_000;
+const MAX_THREAD_MESSAGE_CONTEXT = 8_000;
+const MAX_TOTAL_THREAD_CONTEXT = 64_000;
+const MAX_AGENT_HISTORY = 100;
+
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
-function defineTool(def: {
+function defineTool<TSchema extends z.ZodTypeAny, TResult>(def: {
 	description: string;
-	parameters: z.ZodType<any>;
-	execute: (...args: any[]) => Promise<any>;
+	parameters: TSchema;
+	execute: (input: z.infer<TSchema>) => Promise<TResult>;
 }) {
 	return {
 		description: def.description,
@@ -107,22 +113,22 @@ async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
 	return DEFAULT_SYSTEM_PROMPT;
 }
 
-function createEmailTools(env: Env, mailboxId: string) {
+function createEmailTools(env: Env, mailboxId: string): ToolSet {
 	return {
 		list_emails: defineTool({
 			description:
 				"List emails in a folder. Returns email metadata (id, subject, sender, recipient, date, read/starred status, thread_id). Use folder='inbox' for received emails, 'sent' for sent emails.",
 			parameters: z.object({
 				folder: z
-					.string()
+					.string().max(100)
 					.default(Folders.INBOX)
 					.describe(FOLDER_TOOL_DESCRIPTION),
 				limit: z
-					.number()
+					.number().int().min(1).max(100)
 					.default(20)
 					.describe("Maximum number of emails to return"),
 				page: z
-					.number()
+					.number().int().min(1).max(100)
 					.default(1)
 					.describe("Page number for pagination"),
 			}),
@@ -135,7 +141,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 			description:
 				"Get a single email with its full body content and attachments. Use this to read the actual content of an email.",
 			parameters: z.object({
-				emailId: z.string().describe("The email ID to retrieve"),
+				emailId: z.string().max(200).describe("The email ID to retrieve"),
 			}),
 			execute: async ({ emailId }): Promise<unknown> => {
 				return toolGetEmail(env, mailboxId, emailId);
@@ -147,7 +153,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 				"Get all emails in a conversation thread. This is essential for understanding the full context of a conversation before drafting a response. Returns all messages sorted chronologically.",
 			parameters: z.object({
 				threadId: z
-					.string()
+					.string().max(200)
 					.describe(
 						"The thread_id to retrieve all messages for. Get this from an email's thread_id field.",
 					),
@@ -162,12 +168,12 @@ function createEmailTools(env: Env, mailboxId: string) {
 				"Search for emails matching a query across subject and body fields.",
 			parameters: z.object({
 				query: z
-					.string()
+					.string().max(200)
 					.describe(
 						"Search query to match against subject and body",
 					),
 				folder: z
-					.string()
+					.string().max(200)
 					.optional()
 					.describe("Optional folder to restrict search to"),
 			}),
@@ -180,12 +186,12 @@ function createEmailTools(env: Env, mailboxId: string) {
 			description:
 				"Draft a new email (not a reply) and save it to the Drafts folder. This does NOT send — it saves a draft for the operator to review. Use this for composing new outbound emails. Write the body as plain text — no HTML tags.",
 			parameters: z.object({
-				to: z.string().email().describe("Recipient email address"),
+				to: z.string().email().max(320).describe("Recipient email address"),
 				subject: z
-					.string()
+					.string().max(200)
 					.describe("Subject line"),
 				body: z
-					.string()
+					.string().max(1_000_000)
 					.describe(
 						"The plain text body of the email. No HTML — just write normally.",
 					),
@@ -205,14 +211,14 @@ function createEmailTools(env: Env, mailboxId: string) {
 				"Draft a reply to an existing email and save it to the Drafts folder. This does NOT send — it saves a draft for the operator to review and send from the UI. Write the body as plain text — no HTML tags.",
 			parameters: z.object({
 				originalEmailId: z
-					.string()
+					.string().max(200)
 					.describe("The ID of the email being replied to"),
-				to: z.string().email().describe("Recipient email address"),
+				to: z.string().email().max(320).describe("Recipient email address"),
 				subject: z
-					.string()
+					.string().max(200)
 					.describe("Subject line (usually 'Re: ...')"),
 				body: z
-					.string()
+					.string().max(1_000_000)
 					.describe(
 						"The plain text body of the reply. No HTML — just write normally.",
 					),
@@ -232,7 +238,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 		mark_email_read: defineTool({
 			description: "Mark an email as read or unread.",
 			parameters: z.object({
-				emailId: z.string().describe("The email ID"),
+				emailId: z.string().max(200).describe("The email ID"),
 				read: z
 					.boolean()
 					.describe("true to mark as read, false for unread"),
@@ -246,9 +252,9 @@ function createEmailTools(env: Env, mailboxId: string) {
 			description:
 				"Move an email to a different folder (inbox, sent, draft, archive, trash).",
 			parameters: z.object({
-				emailId: z.string().describe("The email ID"),
+				emailId: z.string().max(200).describe("The email ID"),
 				folderId: z
-					.string()
+					.string().max(100)
 					.describe(MOVE_FOLDER_TOOL_DESCRIPTION),
 			}),
 			execute: async ({ emailId, folderId }): Promise<unknown> => {
@@ -260,7 +266,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 			description:
 				"Delete a draft email. Use this to discard drafts that are no longer needed or were rejected by the operator.",
 			parameters: z.object({
-				draftId: z.string().describe("The ID of the draft to delete"),
+				draftId: z.string().max(200).describe("The ID of the draft to delete"),
 			}),
 			execute: async ({ draftId }): Promise<unknown> => {
 				return toolDiscardDraft(env, mailboxId, draftId);
@@ -269,23 +275,26 @@ function createEmailTools(env: Env, mailboxId: string) {
 	};
 }
 
-// Use `any` for the Env generic to avoid type conflicts between the custom
-// SEND_EMAIL binding shape and the AIChatAgent constraint.  The actual env
-// is fully typed inside the tools via the closure.
-export class EmailAgent extends AIChatAgent<any> {
-	async onChatMessage(onFinish: any) {
-		const env = this.env as Env;
+export class EmailAgent extends AIChatAgent<Env> {
+	async onChatMessage(
+		onFinish: StreamTextOnFinishCallback<ToolSet>,
+		_options?: OnChatMessageOptions,
+	) {
+		const env = this.env;
 		const mailboxId = this.name;
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
+		const rateAllowed = await getMailboxStub(env, mailboxId).checkRateLimit("agent:minute", 60, 60);
+		if (!rateAllowed) return new Response(JSON.stringify({ error: "Agent rate limit exceeded" }), { status: 429, headers: { "Content-Type": "application/json" } });
 		const result = streamText({
 			model: workersai("@cf/moonshotai/kimi-k2.5"),
 			system: systemPrompt,
-			messages: await convertToModelMessages(this.messages),
+			messages: await convertToModelMessages(this.messages.slice(-MAX_AGENT_HISTORY)),
 			tools,
 			stopWhen: stepCountIs(10),
+			abortSignal: _options?.abortSignal,
 			onFinish,
 		});
 
@@ -313,6 +322,7 @@ export class EmailAgent extends AIChatAgent<any> {
 				};
 				const result = await this.handleNewEmail(emailData);
 				return new Response(JSON.stringify(result), {
+					status: result && typeof result === "object" && "status" in result && result.status === "error" ? 500 : 200,
 					headers: { "Content-Type": "application/json" },
 				});
 			} catch (e) {
@@ -337,7 +347,7 @@ export class EmailAgent extends AIChatAgent<any> {
 		subject: string;
 		threadId: string;
 	}) {
-		const env = this.env as Env;
+		const env = this.env;
 		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, emailData.mailboxId);
 		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
@@ -372,12 +382,12 @@ export class EmailAgent extends AIChatAgent<any> {
 							parts: [{ type: "text" as const, text: "⚠️ Blocked auto-draft creation: the email appears to contain prompt injection or malicious instructions." }],
 						},
 					];
-					await this.persistMessages([...this.messages, ...newMessages]);
+					await this.persistMessages([...this.messages, ...newMessages].slice(-MAX_AGENT_HISTORY));
 					
 					return;
 				}
 				
-				emailBody = stripHtmlToText(email.body);
+				emailBody = stripHtmlToText(email.body).slice(0, MAX_AUTO_EMAIL_CONTEXT);
 			}
 
 		// Load thread for conversation context
@@ -391,9 +401,10 @@ export class EmailAgent extends AIChatAgent<any> {
 				}),
 			);
 			fullThread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-			threadContext = fullThread
-				.map((e) => `[${e.date}] ${e.sender} → ${e.recipient} (${e.folder_id}): ${e.body_text.substring(0, 500)}`)
-				.join("\n\n");
+				threadContext = fullThread
+					.map((e) => `[${e.date}] ${e.sender} → ${e.recipient} (${e.folder_id}): ${e.body_text.substring(0, MAX_THREAD_MESSAGE_CONTEXT)}`)
+					.join("\n\n")
+					.slice(0, MAX_TOTAL_THREAD_CONTEXT);
 
 			// Scan thread context for prompt injection too -- an attacker
 			// could plant an injection in an earlier email in the thread
@@ -418,7 +429,7 @@ export class EmailAgent extends AIChatAgent<any> {
 							parts: [{ type: "text" as const, text: "Blocked auto-draft creation: the thread context appears to contain prompt injection or malicious instructions." }],
 						},
 					];
-					await this.persistMessages([...this.messages, ...newMessages]);
+					await this.persistMessages([...this.messages, ...newMessages].slice(-MAX_AGENT_HISTORY));
 					return;
 				}
 			}
@@ -548,7 +559,7 @@ Based on the email content and thread context above, draft a reply using draft_r
 				},
 			];
 
-			await this.persistMessages([...this.messages, ...newMessages]);
+			await this.persistMessages([...this.messages, ...newMessages].slice(-MAX_AGENT_HISTORY));
 
 			return { status: "draft_generated", text: result.text };
 		} catch (e) {

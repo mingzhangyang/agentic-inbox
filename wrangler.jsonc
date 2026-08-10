@@ -1,10 +1,22 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "agentic-inbox",
-	"compatibility_date": "2025-11-28",
+	"compatibility_date": "2026-08-10",
 	"main": "./workers/app.ts",
 	"observability": {
-		"enabled": true
+		"enabled": true,
+		"head_sampling_rate": 0.1,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 0.1,
+			"invocation_logs": true,
+			"persist": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.05,
+			"persist": true
+		}
 	},
 	"compatibility_flags": [
 		"nodejs_compat"
@@ -15,21 +27,51 @@
 		// Set them as environment variables in the Cloudflare dashboard (or .dev.vars
 		// locally). Auth is ON by default — set ACCESS_AUTH_ENABLED=false to disable.
 		"DOMAINS": "in10years.app",
-		"EMAIL_ADDRESSES": []
+		"EMAIL_ADDRESSES": [],
+		"DRY_RUN_EMAILS": "true"
 	},
 	"send_email": [
 		{
-			"name": "EMAIL",
-			"remote": true
+			"name": "EMAIL"
 		}
 	],
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
 			"bucket_name": "in10years-storage",
-			"preview_bucket_name": "in10years-storage"
+			"preview_bucket_name": "agentic-inbox-preview"
 		}
 	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "OUTBOUND_QUEUE",
+				"queue": "agentic-inbox-outbound"
+			},
+			{
+				"binding": "AUTO_DRAFT_QUEUE",
+				"queue": "agentic-inbox-auto-draft"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "agentic-inbox-outbound",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5,
+				"dead_letter_queue": "agentic-inbox-outbound-dlq",
+				"max_concurrency": 1
+			},
+			{
+				"queue": "agentic-inbox-auto-draft",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5,
+				"dead_letter_queue": "agentic-inbox-auto-draft-dlq",
+				"max_concurrency": 1
+			}
+		]
+	},
 	"ai": {
 		"binding": "AI"
 	},
@@ -68,5 +110,29 @@
 				"EmailMCP"
 			]
 		}
-	]
+	],
+	"env": {
+		"staging": {
+			"vars": {
+				"DRY_RUN_EMAILS": "true"
+			},
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "agentic-inbox-staging"
+				}
+			]
+		},
+		"production": {
+			"vars": {
+				"DRY_RUN_EMAILS": "false"
+			},
+			"r2_buckets": [
+				{
+					"binding": "BUCKET",
+					"bucket_name": "agentic-inbox"
+				}
+			]
+		}
+	}
 }

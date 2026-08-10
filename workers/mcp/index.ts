@@ -99,18 +99,18 @@ export class EmailMCP extends McpAgent<Env> {
 			"List emails in a mailbox folder. Returns email metadata (id, subject, sender, recipient, date, read/starred status, thread_id).",
 			{
 				mailboxId: z
-					.string()
+					.string().min(3).max(320)
 					.describe("The mailbox email address (e.g. user@example.com)"),
 				folder: z
-					.string()
+					.string().max(100)
 					.default(Folders.INBOX)
 					.describe(FOLDER_TOOL_DESCRIPTION),
 				limit: z
-					.number()
+					.number().int().min(1).max(100)
 					.default(20)
 					.describe("Maximum number of emails to return"),
 				page: z
-					.number()
+					.number().int().min(1).max(100)
 					.default(1)
 					.describe("Page number for pagination"),
 			},
@@ -127,8 +127,8 @@ export class EmailMCP extends McpAgent<Env> {
 			"get_email",
 			"Get a single email with its full body content. Use this to read the actual content of an email.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				emailId: z.string().describe("The email ID to retrieve"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				emailId: z.string().max(200).describe("The email ID to retrieve"),
 			},
 			async ({ mailboxId, emailId }) => {
 				const denied = await verifyMailbox(mailboxId);
@@ -149,9 +149,9 @@ export class EmailMCP extends McpAgent<Env> {
 			"get_thread",
 			"Get all emails in a conversation thread. Returns all messages sorted chronologically.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
 				threadId: z
-					.string()
+					.string().max(200)
 					.describe("The thread_id to retrieve all messages for"),
 			},
 			async ({ mailboxId, threadId }) => {
@@ -167,10 +167,10 @@ export class EmailMCP extends McpAgent<Env> {
 			"search_emails",
 			"Search for emails matching a query across subject and body fields.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				query: z.string().describe("Search query to match against subject and body"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				query: z.string().max(200).describe("Search query to match against subject and body"),
 				folder: z
-					.string()
+					.string().max(100)
 					.optional()
 					.describe("Optional folder to restrict search to"),
 			},
@@ -187,14 +187,14 @@ export class EmailMCP extends McpAgent<Env> {
 			"draft_reply",
 			"Draft a reply to an email and save it to the Drafts folder. Does NOT send — saves a draft for review.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
 				originalEmailId: z
-					.string()
+					.string().max(200)
 					.describe("The ID of the email being replied to"),
-				to: z.string().email().describe("Recipient email address"),
-				subject: z.string().describe("Subject line (usually 'Re: ...')"),
+				to: z.string().email().max(320).describe("Recipient email address"),
+				subject: z.string().max(200).describe("Subject line (usually 'Re: ...')"),
 				bodyHtml: z
-					.string()
+					.string().max(1_000_000)
 					.describe("The HTML body of the reply"),
 			},
 			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
@@ -217,19 +217,19 @@ export class EmailMCP extends McpAgent<Env> {
 			"create_draft",
 			"Create a new draft email. Can be a new email or a reply draft.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
 				to: z
-					.string()
+					.string().email().max(320)
 					.optional()
 					.describe("Recipient email address (optional for early drafts)"),
-				subject: z.string().describe("Subject line"),
-				bodyHtml: z.string().describe("The HTML body of the draft"),
+					subject: z.string().max(200).describe("Subject line"),
+					bodyHtml: z.string().max(1_000_000).describe("The HTML body of the draft"),
 				in_reply_to: z
-					.string()
+					.string().max(200)
 					.optional()
 					.describe("The ID of the email this draft is replying to (optional)"),
 				thread_id: z
-					.string()
+					.string().max(200)
 					.optional()
 					.describe("Thread ID to attach this draft to (optional)"),
 			},
@@ -263,14 +263,14 @@ export class EmailMCP extends McpAgent<Env> {
 			"update_draft",
 			"Update an existing draft email's content.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				draftId: z.string().describe("The ID of the draft to update"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				draftId: z.string().max(200).describe("The ID of the draft to update"),
 				to: z
-					.string()
+					.string().email().max(320)
 					.optional()
 					.describe("Updated recipient email address"),
-				subject: z.string().optional().describe("Updated subject line"),
-				bodyHtml: z.string().optional().describe("Updated HTML body"),
+					subject: z.string().max(200).optional().describe("Updated subject line"),
+					bodyHtml: z.string().max(1_000_000).optional().describe("Updated HTML body"),
 			},
 			async ({ mailboxId, draftId, to, subject, bodyHtml }) => {
 				const denied = await verifyMailbox(mailboxId);
@@ -299,8 +299,8 @@ export class EmailMCP extends McpAgent<Env> {
 			"delete_email",
 			"Permanently delete an email by ID.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				emailId: z.string().describe("The email ID to delete"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				emailId: z.string().max(200).describe("The email ID to delete"),
 			},
 			async ({ mailboxId, emailId }) => {
 				const denied = await verifyMailbox(mailboxId);
@@ -315,13 +315,13 @@ export class EmailMCP extends McpAgent<Env> {
 			"send_reply",
 			"Send a reply to an email. Only call after drafting and getting confirmation.",
 			{
-				mailboxId: z.string().describe("The mailbox email address to send from"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address to send from"),
 				originalEmailId: z
-					.string()
+					.string().max(200)
 					.describe("The ID of the email being replied to"),
-				to: z.string().email().describe("Recipient email address"),
-				subject: z.string().describe("Subject line"),
-				bodyHtml: z.string().describe("The HTML body of the reply"),
+				to: z.string().email().max(320).describe("Recipient email address"),
+				subject: z.string().max(200).describe("Subject line"),
+				bodyHtml: z.string().max(1_000_000).describe("The HTML body of the reply"),
 			},
 			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
 				const denied = await verifyMailbox(mailboxId);
@@ -357,10 +357,10 @@ export class EmailMCP extends McpAgent<Env> {
 			"send_email",
 			"Send a new email (not a reply). Only call after getting confirmation.",
 			{
-				mailboxId: z.string().describe("The mailbox email address to send from"),
-				to: z.string().email().describe("Recipient email address"),
-				subject: z.string().describe("Subject line"),
-				bodyHtml: z.string().describe("The HTML body of the email"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address to send from"),
+				to: z.string().email().max(320).describe("Recipient email address"),
+				subject: z.string().max(200).describe("Subject line"),
+				bodyHtml: z.string().max(1_000_000).describe("The HTML body of the email"),
 			},
 			async ({ mailboxId, to, subject, bodyHtml }) => {
 				const denied = await verifyMailbox(mailboxId);
@@ -388,8 +388,8 @@ export class EmailMCP extends McpAgent<Env> {
 			"mark_email_read",
 			"Mark an email as read or unread.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				emailId: z.string().describe("The email ID"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				emailId: z.string().max(200).describe("The email ID"),
 				read: z.boolean().describe("true to mark as read, false for unread"),
 			},
 			async ({ mailboxId, emailId, read }) => {
@@ -405,10 +405,10 @@ export class EmailMCP extends McpAgent<Env> {
 			"move_email",
 			"Move an email to a different folder (inbox, sent, draft, archive, trash).",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
-				emailId: z.string().describe("The email ID"),
+				mailboxId: z.string().min(3).max(320).describe("The mailbox email address"),
+				emailId: z.string().max(200).describe("The email ID"),
 				folderId: z
-					.string()
+					.string().max(100)
 					.describe(MOVE_FOLDER_TOOL_DESCRIPTION),
 			},
 			async ({ mailboxId, emailId, folderId }) => {

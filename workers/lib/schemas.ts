@@ -33,8 +33,10 @@ export interface EmailMetadata {
 
 export interface EmailFull extends EmailMetadata {
 	body?: string | null;
+	body_format?: "html" | "text" | string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
+	delivery_status?: string | null;
 	attachments?: AttachmentInfo[];
 }
 
@@ -45,6 +47,7 @@ export interface AttachmentInfo {
 	size: number;
 	content_id?: string | null;
 	disposition?: string | null;
+	object_key?: string | null;
 }
 
 // ── Zod Schemas ────────────────────────────────────────────────────
@@ -54,6 +57,7 @@ export const MailboxSettingsSchema = z
 		fromName: z.string().max(100).optional(),
 		agentSystemPrompt: z.string().max(10_000).optional(),
 		autoDraftEnabled: z.boolean().optional(),
+		autoDraftMaxPerDay: z.number().int().min(1).max(200).optional(),
 		forwarding: z
 			.object({
 				enabled: z.boolean(),
@@ -83,8 +87,11 @@ export type MailboxSettings = z.infer<typeof MailboxSettingsSchema>;
 
 const RecipientFieldSchema = z.union([
 	z.string().email(),
-	z.array(z.string().email()).min(1),
+	z.array(z.string().email()).min(1).max(20),
 ]);
+
+export const MAX_BODY_LENGTH = 1024 * 1024;
+export const MAX_SUBJECT_LENGTH = 200;
 
 export const ErrorResponseSchema = z.object({
 	error: z.string(),
@@ -97,26 +104,33 @@ export const SendEmailRequestSchema = z
 		bcc: RecipientFieldSchema.optional(),
 		from: z.union([
 			z.string().email(),
-			z.object({ email: z.string().email(), name: z.string() }),
+			z.object({ email: z.string().email(), name: z.string().max(100) }).strict(),
 		]),
-		subject: z.string(),
-		html: z.string().optional(),
-		text: z.string().optional(),
+		subject: z.string().max(MAX_SUBJECT_LENGTH),
+		html: z.string().max(MAX_BODY_LENGTH).optional(),
+		text: z.string().max(MAX_BODY_LENGTH).optional(),
 		attachments: z
 			.array(
 				z.object({
-					content: z.string(), // base64 encoded
-					filename: z.string(),
-					type: z.string(),
+					content: z.string().max(14_000_000), // base64 encoded
+					filename: z.string().min(1).max(255),
+					type: z.string().min(1).max(128),
 					disposition: z.enum(["attachment", "inline"]),
-					contentId: z.string().optional(),
+					contentId: z.string().max(255).optional(),
+				}).strict().superRefine((attachment, context) => {
+					if (attachment.disposition === "inline" && !attachment.contentId) {
+						context.addIssue({ code: z.ZodIssueCode.custom, message: "Inline attachments require contentId", path: ["contentId"] });
+					}
 				}),
 			)
+			.max(20)
 			.optional(),
 		in_reply_to: z.string().optional(),
 		references: z.array(z.string()).optional(),
 		thread_id: z.string().optional(),
+		source_draft_id: z.string().optional(),
 	})
+	.strict()
 	.refine((data) => data.html || data.text, {
 		message: "Either 'html' or 'text' must be provided",
 	});

@@ -166,6 +166,63 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX IF NOT EXISTS idx_emails_folder_id ON emails(folder_id);
             CREATE INDEX IF NOT EXISTS idx_emails_date ON emails(date);
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
-        `,
+		`,
+	},
+	{
+		name: "9_delivery_dedupe_and_attachment_keys",
+		sql: txn(`
+            ALTER TABLE emails ADD COLUMN body_format TEXT NOT NULL DEFAULT 'html';
+            ALTER TABLE emails ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent';
+            ALTER TABLE emails ADD COLUMN delivery_operation_id TEXT;
+            ALTER TABLE emails ADD COLUMN source_draft_id TEXT;
+            ALTER TABLE emails ADD COLUMN inbound_key TEXT;
+            ALTER TABLE attachments ADD COLUMN object_key TEXT;
+
+            CREATE UNIQUE INDEX idx_emails_inbound_key ON emails(inbound_key) WHERE inbound_key IS NOT NULL;
+            CREATE INDEX idx_emails_delivery_operation_id ON emails(delivery_operation_id);
+
+            CREATE TABLE outbox (
+                operation_id TEXT PRIMARY KEY,
+                email_id TEXT NOT NULL UNIQUE,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until INTEGER,
+                next_attempt_at INTEGER,
+                provider_message_id TEXT,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_outbox_status_next_attempt ON outbox(status, next_attempt_at);
+
+            CREATE TABLE rate_limits (
+                key TEXT PRIMARY KEY,
+                window_start INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+        `),
+	},
+	{
+		name: "10_add_outbox_mailbox_id",
+		sql: txn(`ALTER TABLE outbox ADD COLUMN mailbox_id TEXT NOT NULL DEFAULT '';`),
+	},
+	{
+		name: "11_add_agent_jobs",
+		sql: txn(`
+            CREATE TABLE agent_jobs (
+                email_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                lease_until INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+		`),
+	},
+	{
+		name: "12_add_agent_job_mailbox_id",
+		sql: txn(`ALTER TABLE agent_jobs ADD COLUMN mailbox_id TEXT NOT NULL DEFAULT '';`),
 	},
 ];

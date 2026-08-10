@@ -37,11 +37,17 @@ export function getMailboxStub(
 export async function listMailboxes(
 	bucket: R2Bucket,
 ): Promise<{ id: string; email: string }[]> {
-	const list = await bucket.list({ prefix: "mailboxes/" });
-	return list.objects.map((obj) => {
-		const id = obj.key.replace("mailboxes/", "").replace(".json", "");
-		return { id, email: id };
-	});
+	const mailboxes: { id: string; email: string }[] = [];
+	let cursor: string | undefined;
+	do {
+		const list = await bucket.list({ prefix: "mailboxes/", ...(cursor ? { cursor } : {}) });
+		for (const obj of list.objects) {
+			const id = obj.key.replace("mailboxes/", "").replace(".json", "");
+			mailboxes.push({ id, email: id });
+		}
+		cursor = list.truncated ? list.cursor : undefined;
+	} while (cursor);
+	return mailboxes;
 }
 
 // ── Sender Validation ──────────────────────────────────────────────
@@ -221,10 +227,6 @@ export function buildQuotedReplyBlock(original: {
 
 // ── Tool Logic (getFullEmail / getFullThread) ──────────────────────
 
-type MailboxThreadReaderStub = {
-	getThreadEmails: (threadId: string) => Promise<EmailFull[]>;
-};
-
 /**
  * Fetch a single email and return it with both HTML and plain-text body.
  * Returns null if the email is not found.
@@ -249,8 +251,7 @@ export async function getFullThread(
 	stub: DurableObjectStub<MailboxDO>,
 	threadId: string,
 ) {
-	const threadStub = stub as unknown as MailboxThreadReaderStub;
-	const emails = await threadStub.getThreadEmails(threadId);
+	const emails = await stub.getThreadEmails(threadId);
 
 	const enriched = emails.map((email) => {
 		const textBody = email.body ? stripHtmlToText(email.body) : "";
@@ -259,7 +260,7 @@ export async function getFullThread(
 
 	// Already sorted ASC by the DO query, but ensure consistency
 	enriched.sort(
-		(a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+		(a, b) => new Date(a.date || "").getTime() - new Date(b.date || "").getTime(),
 	);
 
 	return { thread_id: threadId, message_count: enriched.length, messages: enriched };

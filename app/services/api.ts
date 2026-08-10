@@ -66,10 +66,11 @@ function get<T>(url: string, opts?: { params?: Record<string, string>; responseT
 	});
 }
 
-function post<T>(url: string, body?: unknown, opts?: { signal?: AbortSignal }) {
+function post<T>(url: string, body?: unknown, opts?: { signal?: AbortSignal; headers?: Record<string, string> }) {
 	return request<T>(url, {
 		method: "POST",
 		signal: opts?.signal,
+		headers: opts?.headers,
 		body: body != null ? JSON.stringify(body) : undefined,
 	});
 }
@@ -114,7 +115,7 @@ const api = {
 	listEmails: (mailboxId: string, params: Record<string, string>, opts?: { signal?: AbortSignal }) =>
 		get<EmailListResponse | Email[]>(`/api/v1/mailboxes/${mailboxId}/emails`, { params, signal: opts?.signal }),
 	sendEmail: (mailboxId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails`, email),
+		post<{ id: string; operationId: string; status: string }>(`/api/v1/mailboxes/${mailboxId}/emails`, email, { headers: { "Idempotency-Key": crypto.randomUUID() } }),
 	getEmail: (mailboxId: string, id: string, opts?: { signal?: AbortSignal }) =>
 		get<Email>(`/api/v1/mailboxes/${mailboxId}/emails/${id}`, { signal: opts?.signal }),
 	updateEmail: (mailboxId: string, id: string, data: unknown) =>
@@ -141,11 +142,11 @@ const api = {
 			thread_id?: string;
 			draft_id?: string;
 		},
-	) => post<{ draft_id: string }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
+	) => post<{ id: string; status: string }>(`/api/v1/mailboxes/${mailboxId}/drafts`, draft),
 	replyToEmail: (mailboxId: string, emailId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email),
+		post<{ id: string; operationId: string; status: string }>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/reply`, email, { headers: { "Idempotency-Key": crypto.randomUUID() } }),
 	forwardEmail: (mailboxId: string, emailId: string, email: unknown) =>
-		post<void>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/forward`, email),
+		post<{ id: string; operationId: string; status: string }>(`/api/v1/mailboxes/${mailboxId}/emails/${emailId}/forward`, email, { headers: { "Idempotency-Key": crypto.randomUUID() } }),
 
 	// Folders
 	listFolders: (mailboxId: string) =>
